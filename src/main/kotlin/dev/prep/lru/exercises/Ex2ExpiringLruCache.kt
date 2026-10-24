@@ -2,26 +2,11 @@ package dev.prep.lru.exercises
 
 import dev.prep.lru.Cache
 import dev.prep.lru.CacheStats
+import dev.prep.lru.DoublyLinkedList
+import dev.prep.lru.Node
+import dev.prep.lru.RemovalCause
 import dev.prep.lru.RemovalListener
 
-/**
- * EXERCISE 2 — LRU + time-to-live (expire-after-write).
- *
- * Android angle: caching API responses (e.g. a driver's HOS clocks) that are only valid for N
- * seconds. Clock is injected so tests never sleep — say this out loud in the interview.
- *
- * Spec (tests: Ex2ExpiringLruCacheTest):
- * - An entry written at time `t` is expired once `clock() - t >= ttlMillis`.
- * - Expiry is lazy: an expired entry found by [get]/[peek]/[containsKey] is removed on the spot,
- *   reported with cause EXPIRED, and treated as absent ([get] counts a miss).
- * - [put] resets the write time. [get] does NOT extend it (expire-after-write, not after-access).
- * - When full, an expired entry is evicted (cause EXPIRED) in preference to the live LRU entry.
- * - [purgeExpired] eagerly removes every expired entry and returns how many it removed.
- * - [size] may include expired-but-not-yet-purged entries. [keys] must not.
- *
- * Hint: the LRU list orders by *access*, expiry orders by *write*. Those are different orders.
- * Is an O(n) scan on a full put acceptable? What would you use to make it O(log n) or O(1)?
- */
 class ExpiringLruCache<K : Any, V : Any>(
     val capacity: Int,
     val ttlMillis: Long,
@@ -34,23 +19,86 @@ class ExpiringLruCache<K : Any, V : Any>(
         require(ttlMillis > 0) { "ttlMillis must be > 0, was $ttlMillis" }
     }
 
-    fun purgeExpired(): Int = TODO("Exercise 2")
+    private class Entry<V>(val value: V, val writtenAt: Long)
 
-    override val size: Int get() = TODO("Exercise 2")
+    private val index = HashMap<K, Node<K, Entry<V>>>()
+    private val order = DoublyLinkedList<K, Entry<V>>()
+    private var hits = 0L
+    private var misses = 0L
+    private var evictions = 0L
 
-    override fun get(key: K): V? = TODO("Exercise 2")
+    private fun isExpired(n: Node<K, Entry<V>>) = clock() - n.value.writtenAt >= ttlMillis
 
-    override fun peek(key: K): V? = TODO("Exercise 2")
+    private fun expire(n: Node<K, Entry<V>>) {
+        index.remove(n.key)
+        order.unlink(n)
+        listener.onRemoved(n.key, n.value.value, RemovalCause.EXPIRED)
+    }
 
-    override fun put(key: K, value: V): V? = TODO("Exercise 2")
+    private fun liveNode(key: K): Node<K, Entry<V>>? {
+        val n = index[key] ?: return null
+        if (isExpired(n)) {
+            expire(n)
+            return null
+        }
+        return n
+    }
 
-    override fun remove(key: K): V? = TODO("Exercise 2")
+    fun purgeExpired(): Int {
+        val expired = order.mostRecentFirst().filter(::isExpired).toList()
+        expired.forEach(::expire)
+        return expired.size
+    }
 
-    override fun containsKey(key: K): Boolean = TODO("Exercise 2")
+    override val size: Int get() = index.size
 
-    override fun clear(): Unit = TODO("Exercise 2")
+    override fun get(key: K): V? {
+        val n = liveNode(key) ?: run { misses++; return null }
+        hits++
+        order.moveToFront(n)
+        return n.value.value
+    }
 
-    override fun keys(): List<K> = TODO("Exercise 2")
+    override fun peek(key: K): V? = liveNode(key)?.value?.value
 
-    override fun stats(): CacheStats = TODO("Exercise 2")
+    override fun put(key: K, value: V): V? {
+        val existing = liveNode(key)
+        if (existing != null) {
+            val old = existing.value.value
+            existing.value = Entry(value, clock())
+            order.moveToFront(existing)
+            listener.onRemoved(key, old, RemovalCause.REPLACED)
+            return old
+        }
+        var evicted: Node<K, Entry<V>>? = null
+        if (index.size == capacity && purgeExpired() == 0) {
+            evicted = order.removeLast()!!
+            index.remove(evicted.key)
+            evictions++
+        }
+        val n = Node(key, Entry(value, clock()))
+        order.addFirst(n)
+        index[key] = n
+        evicted?.let { listener.onRemoved(it.key, it.value.value, RemovalCause.EVICTED) }
+        return null
+    }
+
+    override fun remove(key: K): V? {
+        val n = index.remove(key) ?: return null
+        order.unlink(n)
+        listener.onRemoved(key, n.value.value, RemovalCause.EXPLICIT)
+        return n.value.value
+    }
+
+    override fun containsKey(key: K): Boolean = liveNode(key) != null
+
+    override fun clear() {
+        val removed = order.mostRecentFirst().toList()
+        index.clear(); order.clear()
+        removed.forEach { listener.onRemoved(it.key, it.value.value, RemovalCause.EXPLICIT) }
+    }
+
+    override fun keys(): List<K> = order.mostRecentFirst().filterNot(::isExpired).map { it.key }.toList()
+
+    override fun stats(): CacheStats = CacheStats(hits, misses, evictions)
 }
